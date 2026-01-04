@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>FOAM ZIP ⇄ XLSX (form_id safe)</title>
+
+    <script src="./xlsx.full.min.js"></script>
+    <script src="./jszip.min.js"></script>
+
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        background: #f3f3f3;
+        padding: 40px;
+        text-align: center;
+      }
+      button {
+        background-color: #007bff;
+        color: white;
+        border: none;
+        padding: 10px 18px;
+        border-radius: 6px;
+        cursor: pointer;
+        margin: 6px;
+      }
+      button:hover {
+        background-color: #0056b3;
+      }
+      pre {
+        background: #111;
+        color: #0f0;
+        padding: 10px;
+        border-radius: 8px;
+        text-align: left;
+        font-size: 13px;
+        max-height: 220px;
+        overflow-y: auto;
+      }
+    </style>
+  </head>
+
+  <body>
+    <h1>FOAM ZIP ⇄ XLSX Converter (Safe form_id)</h1>
+
+    <h3>Step A — ZIP → XLSX</h3>
+    <input type="file" id="zipInputA" accept=".zip" />
+    <button onclick="zipToExcel()">Convert ZIP → XLSX</button>
+
+    <h3 style="margin-top: 30px">Step B — XLSX + ZIP → Updated ZIP</h3>
+    <input type="file" id="xlsxInputB" accept=".xlsx" /><br />
+    <input type="file" id="zipInputB" accept=".zip" /><br />
+    <button onclick="excelToZip()">Convert → Updated ZIP</button>
+
+    <h3>Logs</h3>
+    <pre id="log">Ready.</pre>
+
+    <script>
+      const VALID_KEYS = [
+        "Assigned To",
+        "name",
+        "UC ID",
+        "Business Rule Category",
+        "BR Display",
+        "BR Data Fetched",
+        "Business Rule",
+        "Component Library",
+        "Screen#",
+        "MegaSet Number",
+        "Component Number",
+        "Component Label",
+        "Component Name",
+        "Component Type",
+        "Component Behavior ",
+        "Enable /disabled",
+        "enablement point",
+        "Visible / Invisible",
+        "Visible Enablement",
+        "DLV",
+        "FLV",
+        "Min. Length",
+        "Max. Length",
+        "Data Type",
+        "Masking",
+        "Mandatory",
+        "Default value",
+        "Tab Indexes",
+        "Event ",
+        "Output Src",
+        "Screen Transition",
+        "FSM Transition Number",
+        "Transition",
+        "Request DTO",
+        "Response DTO",
+        "CAPI ID",
+        "Link",
+        "project_id"
+      ];
+
+      const MAX_LEN = 32000;
+
+      function log(...args) {
+        const el = document.getElementById("log");
+        el.textContent = args.join(" ") + "\n" + el.textContent;
+      }
+
+      function escapeJsonPointer(str) {
+        return str.replace(/~/g, "~0").replace(/\//g, "~1");
+      }
+
+      function traverseForProperties(obj, cb, path = "") {
+        if (!obj || typeof obj !== "object") return;
+        if (obj.properties && typeof obj.properties === "object") {
+          cb(obj.properties, path + "/properties");
+        }
+        if (Array.isArray(obj)) {
+          obj.forEach((v, i) =>
+            traverseForProperties(v, cb, path + "/" + i)
+          );
+        } else {
+          Object.keys(obj).forEach((k) =>
+            traverseForProperties(
+              obj[k],
+              cb,
+              path + "/" + escapeJsonPointer(k)
+            )
+          );
+        }
+      }
+
+      function setByJsonPath(root, jsonPath, newVal) {
+        const parts = jsonPath
+          .split("/")
+          .slice(1)
+          .map((p) => p.replace(/~1/g, "/").replace(/~0/g, "~"));
+
+        let cur = root;
+        for (let i = 0; i < parts.length - 1; i++) {
+          const key = parts[i];
+          cur = Array.isArray(cur) ? cur[Number(key)] : cur[key];
+          if (!cur) return false;
+        }
+        const last = parts[parts.length - 1];
+        if (Array.isArray(cur)) cur[Number(last)] = newVal;
+        else cur[last] = newVal;
+        return true;
+      }
+
+      function safeValue(v) {
+        if (typeof v === "string" && v.length > MAX_LEN)
+          return v.slice(0, MAX_LEN) + "...(truncated)";
+        return v;
+      }
+
+      async function zipToExcel() {
+        const file = document.getElementById("zipInputA").files[0];
+        if (!file) return alert("Select ZIP");
+
+        const zip = await JSZip.loadAsync(file);
+        const rows = [];
+
+        for (const path in zip.files) {
+          const entry = zip.files[path];
+          if (entry.dir || (!path.endsWith(".form") && !path.endsWith(".json")))
+            continue;
+
+          try {
+            const text = await entry.async("text");
+            const json = JSON.parse(text.trim().replace(/^[\(\)]/g, ""));
+            const formId = json.id || "";
+
+            let idx = 0;
+            traverseForProperties(json, (props, jpath) => {
+              const row = {};
+              VALID_KEYS.forEach(
+                (k) => (row[k] = safeValue(props[k] ?? ""))
+              );
+              row.form_id = formId; // ✅ READ-ONLY COLUMN
+              row._FILE_PATH = path;
+              row._JSON_PATH = jpath;
+              row._ROW_ID = path + "::" + idx++;
+              rows.push(row);
+            });
+          } catch (e) {
+            log("Error parsing", path);
+          }
+        }
+
+        const ws = XLSX.utils.json_to_sheet(rows);
+        const wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, ws, "form_data");
+        XLSX.writeFile(wb, "foam_data_export.xlsx");
+        log("Exported rows:", rows.length);
+      }
+
+      async function excelToZip() {
+        const xlsx = document.getElementById("xlsxInputB").files[0];
+        const zipFile = document.getElementById("zipInputB").files[0];
+        if (!xlsx || !zipFile) return alert("Select both files");
+
+        const origZip = await JSZip.loadAsync(zipFile);
+        const wb = XLSX.read(await xlsx.arrayBuffer(), { type: "array" });
+        const rows = XLSX.utils.sheet_to_json(
+          wb.Sheets[wb.SheetNames[0]],
+          { defval: "" }
+        );
+
+        const grouped = {};
+        rows.forEach((r) => {
+          if (!r._FILE_PATH) return;
+          grouped[r._FILE_PATH] = grouped[r._FILE_PATH] || [];
+          grouped[r._FILE_PATH].push(r);
+        });
+
+        const outZip = new JSZip();
+        let updated = 0;
+
+        for (const path in origZip.files) {
+          const entry = origZip.files[path];
+          if (entry.dir) {
+            outZip.folder(path);
+            continue;
+          }
+
+          let content = await entry.async("text");
+          if ((path.endsWith(".form") || path.endsWith(".json")) && grouped[path]) {
+            const json = JSON.parse(content);
+            grouped[path].forEach((r) => {
+              const newProps = {};
+              VALID_KEYS.forEach((k) => (newProps[k] = safeValue(r[k])));
+              setByJsonPath(json, r._JSON_PATH, newProps);
+            });
+            content = JSON.stringify(json, null, 2);
+            updated++;
+          }
+          outZip.file(path, content);
+        }
+
+        const blob = await outZip.generateAsync({ type: "blob" });
+        const a = document.createElement("a");
+        a.href = URL.createObjectURL(blob);
+        a.download = "updated_" + Date.now() + ".zip";
+        a.click();
+
+        log("Updated files:", updated);
+      }
+    </script>
+  </body>
+</html>
